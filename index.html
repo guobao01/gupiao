@@ -63,6 +63,11 @@ input[type=color]{width:22px;height:22px;border:none;padding:0;background:none;c
 .legend{display:flex;gap:13px;color:var(--muted);font-size:12px;flex-wrap:wrap;align-items:center}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
 .chart-wrap{position:relative;height:500px;padding:6px 8px}
+/* 全屏看图：铺满视口，图表区自动占满剩余高度，可显示更多K线 */
+.chart-card.fullscreen{position:fixed;inset:0;z-index:40;border-radius:0;border:none;box-shadow:none;display:flex;flex-direction:column;background:var(--card)}
+.chart-card.fullscreen .chart-head,.chart-card.fullscreen .chart-foot{flex-shrink:0}
+.chart-card.fullscreen .chart-wrap{flex:1;height:auto;min-height:0;padding:8px 12px}
+.fullscreen-btn{padding:5px 11px;font-size:12px;white-space:nowrap}
 canvas{width:100%;height:100%;display:block;touch-action:none}
 .tooltip{position:absolute;pointer-events:none;background:rgba(38,36,58,.95);color:#fff;border-radius:10px;padding:10px 12px;font-size:12px;line-height:1.75;box-shadow:0 8px 22px rgba(0,0,0,.18);display:none;z-index:5;white-space:nowrap}
 .tooltip .up{color:#ff9aa4}.tooltip .down{color:#7fe0c2}
@@ -189,6 +194,7 @@ input[type=file]{display:none}
           <span><i style="background:var(--down)"></i>下跌（绿）</span>
           <span id="modeLabel">画线中 · 单击定点，双击结束</span>
         </div>
+        <button class="btn fullscreen-btn" id="fullscreenBtn" title="全屏显示，展示更多K线（Esc 退出）">⛶ 全屏</button>
       </div>
       <div class="chart-wrap" id="wrap">
         <canvas id="chart"></canvas>
@@ -419,14 +425,51 @@ function lines(){return cur().lines[state.period];}
 function allLines(){return currentLine?lines().concat([currentLine]):lines();}
 let drawing=true, currentLine=null, act=null, hoverIdx=null, editingId=null;
 let drawPreview=null, clickTimer=null;
+let fullscreen=false;
 
 function save(){try{localStorage.setItem(KEY,JSON.stringify(state));setStatus('已自动保存到本机');}catch(e){setStatus('保存失败：'+e.message);}}
 function setStatus(t){$('#status').textContent=t;}
-function priceRange(recs){
+// 价格轴范围：仅取当前可见画面内的K线与趋势线，随缩放/平移实时变化
+function priceRange(recs,g){
+  g=g||geom();
+  const {from,to}=visibleRange(g);
   let lo=Infinity,hi=-Infinity;
-  recs.forEach(r=>{lo=Math.min(lo,r.low);hi=Math.max(hi,r.high);});
-  allLines().forEach(l=>(l.points||[]).forEach(p=>{lo=Math.min(lo,p.price);hi=Math.max(hi,p.price);}));
-  if(!isFinite(lo))return {min:0,max:1};
+  // 1) 可见K线的最高/最低价
+  for(let i=from;i<to&&i<recs.length;i++){
+    if(recs[i].low<lo)lo=recs[i].low;
+    if(recs[i].high>hi)hi=recs[i].high;
+  }
+  // 2) 画面内趋势线段的价格（含与可见边界的插值，避免线跑出画面）
+  const vx0=view().offset-0.5, vx1=vx0+g.plotW/view().cw;
+  function includeLine(l){
+    const pts=l.points||[];
+    for(let i=0;i<pts.length;i++){
+      const p=pts[i];
+      if(i===0){
+        if(p.index>=vx0&&p.index<=vx1){lo=Math.min(lo,p.price);hi=Math.max(hi,p.price);}
+        continue;
+      }
+      const b=pts[i-1];
+      const a0=Math.min(b.index,p.index),a1=Math.max(b.index,p.index);
+      if(a1>=vx0&&a0<=vx1){
+        if(b.index>=vx0&&b.index<=vx1){lo=Math.min(lo,b.price);hi=Math.max(hi,b.price);}
+        if(p.index>=vx0&&p.index<=vx1){lo=Math.min(lo,p.price);hi=Math.max(hi,p.price);}
+        if(b.index!==p.index){
+          const s=Math.max(a0,vx0),e=Math.min(a1,vx1);
+          const t0=(s-b.index)/(p.index-b.index),t1=(e-b.index)/(p.index-b.index);
+          const q0=b.price+(p.price-b.price)*t0,q1=b.price+(p.price-b.price)*t1;
+          lo=Math.min(lo,q0,q1);hi=Math.max(hi,q0,q1);
+        }
+      }
+    }
+  }
+  allLines().forEach(includeLine);
+  if(currentLine)includeLine(currentLine); // 正在绘制的线（点由点击产生，不会随鼠标抖动）
+  // 3) 可见区无数据时退回全部K线，避免坐标轴跳变
+  if(!isFinite(lo)){
+    if(!recs.length)return {min:0,max:1};
+    recs.forEach(r=>{lo=Math.min(lo,r.low);hi=Math.max(hi,r.high);});
+  }
   const pad=(hi-lo)*0.09||1;
   return {min:lo-pad,max:hi+pad};
 }
@@ -457,10 +500,11 @@ function drawTag(x,y,text,color,above,g){
 
 function render(){
   const g=geom(),dpr=window.devicePixelRatio||1;
+  view().offset=limitOffset(view().offset,view().cw); // 兜底：任何路径下都保证有可见K线
   const cw=Math.round(g.W*dpr),ch=Math.round(g.H*dpr);
   if(canvas.width!==cw||canvas.height!==ch){canvas.width=cw;canvas.height=ch;}
   ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,g.W,g.H);
-  const recs=records(),rg=priceRange(recs);
+  const recs=records(),rg=priceRange(recs,g);
   ctx.fillStyle='#fcfcff';ctx.fillRect(PAD.l,PAD.t,g.plotW,g.plotH);
   const step=niceStep(rg.max-rg.min);
   ctx.font='11px -apple-system,"Segoe UI",sans-serif';ctx.textBaseline='middle';
@@ -472,7 +516,9 @@ function render(){
   }
   ctx.textAlign='center';ctx.textBaseline='top';
   const every=Math.max(1,Math.round(78/view().cw));
-  for(let i=Math.ceil(view().offset/every)*every;i<recs.length;i+=every){
+  const axisStart=Math.max(0,Math.ceil(view().offset/every)*every); // 起始索引不得为负，否则 recs[i] undefined 会导致渲染崩溃
+  for(let i=axisStart;i<recs.length;i+=every){
+    if(!recs[i])continue;
     const x=xOf(i);if(x<PAD.l-20||x>PAD.l+g.plotW+20)continue;
     ctx.strokeStyle='#f5f5fa';ctx.beginPath();ctx.moveTo(x+0.5,PAD.t);ctx.lineTo(x+0.5,PAD.t+g.plotH);ctx.stroke();
     ctx.fillStyle='#9a9fb2';ctx.fillText(recs[i].axisLabel||String(recs[i].date).slice(5),x,PAD.t+g.plotH+8);
@@ -638,11 +684,20 @@ function hitTest(px,py){
 }
 function localPos(e){const r=canvas.getBoundingClientRect();return {x:e.clientX-r.left,y:e.clientY-r.top};}
 function snap(p){p.index=clamp(p.index,-2000,2000);p.price=clamp(p.price,-1e7,1e7);return p;}
+// 约束视图偏移：保证屏幕上始终至少有一根K线，避免缩放/平移后图表"消失"
+function limitOffset(off,cw){
+  const g=geom(),n=records().length;
+  if(!n)return 0;
+  const span=g.plotW/cw;        // 一屏可容纳的根数
+  const min=-span;              // 左侧最多留白一屏（再左则所有K线都在右边界外）
+  const max=n-1;                // 右侧：最后一根至少贴左边缘可见
+  return clamp(off,min,max);
+}
 function zoomAt(factor,px){
   const g=geom();if(px===undefined)px=PAD.l+g.plotW/2;
   const idx=(px-PAD.l)/view().cw+view().offset;
   const cw=clamp(view().cw*factor,3,80);
-  view().offset=idx-(px-PAD.l)/cw;
+  view().offset=limitOffset(idx-(px-PAD.l)/cw,cw);
   view().cw=cw;render();
 }
 function refreshCursor(px,py){
@@ -712,7 +767,7 @@ window.addEventListener('mousemove',function(e){
       else act.line.points[act.pi]=snap({index:act.orig[act.pi].index+d.index,price:act.orig[act.pi].price+d.price});
       act.moved=true;
     }else if(act.type==='pan'){
-      view().offset=Math.max(-2000,act.offset-(e.clientX-act.sx)/view().cw);
+      view().offset=limitOffset(act.offset-(e.clientX-act.sx)/view().cw,view().cw);
     }
     render();return;
   }
@@ -759,6 +814,23 @@ $('#periods').addEventListener('click',function(e){
   state.period=p;abortDraw();act=null;hoverIdx=null;editingId=null;lastStatsHtml='';
   save();renderAll();setStatus('已切换到 '+PNAME[p]+'（独立划线）');
 });
+// 全屏看图：图表卡片铺满视口，图表区随窗口高度自适应，显示更多K线
+function setFullscreen(on){
+  const card=document.querySelector('.chart-card');
+  if(!card)return;
+  fullscreen=on;
+  card.classList.toggle('fullscreen',on);
+  document.body.style.overflow=on?'hidden':'';
+  const btn=$('#fullscreenBtn');
+  btn.textContent=on?'✕ 退出全屏':'⛶ 全屏';
+  btn.title=on?'退出全屏（Esc）':'全屏显示，展示更多K线（Esc 退出）';
+  // 切换尺寸时取消未完成的绘制/拖动，避免线条位置错乱
+  if(clickTimer){clearTimeout(clickTimer);clickTimer=null;}
+  act=null;abortDraw();hoverIdx=null;tip.style.display='none';
+  renderLines();render();
+  setStatus(on?'已进入全屏 · 按 Esc 或再次点击按钮退出':'已退出全屏');
+}
+$('#fullscreenBtn').onclick=function(){setFullscreen(!fullscreen);};
 $('#zoomInBtn').onclick=function(){zoomAt(1.25);};
 $('#zoomOutBtn').onclick=function(){zoomAt(0.8);};
 $('#resetViewBtn').onclick=function(){cur().views[state.period]={offset:0,cw:BASE_CW};render();setStatus('视图已重置');};
@@ -1060,6 +1132,7 @@ $('#excelConfirmBtn').onclick=function(){
 };
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'){
+    if(fullscreen){setFullscreen(false);return;} // 全屏时优先退出全屏
     if(clickTimer){clearTimeout(clickTimer);clickTimer=null;}
     if(act||currentLine){act=null;currentLine=null;drawPreview=null;renderLines();render();setStatus('已取消当前操作');}
   }
